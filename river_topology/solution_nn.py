@@ -14,6 +14,11 @@ Requirement map
 - Learned inference rule: a LightGBM model with a per-node softmax objective (softmax_objective,
   train_model) is trained in this script on the training networks; for each channel it scores every other
   channel as its immediate downstream child plus an "outlet" option.
+- Second learned family (neural_logprobs): four from-scratch permutation-equivariant neural networks
+  (NetV1, Net2; channel CNN encoders over the raw series + pair modules over lagged cross-correlation
+  tensors, per-node softmax over candidate children / outlet), trained in this script on all training
+  networks (NN_COMPONENTS, fixed seeds, nothing pretrained). Their mean head log-probabilities are combined
+  log-linearly with the LightGBM head log-probabilities (weight NN_WEIGHT) before tree decoding.
 - Window-count robustness: training examples are built from random 5-window subsets of each training
   network (SUB_K windows x SUB_DRAWS draws, fixed RandomState), so the model learns from evidence of
   varying quality; test networks use all their windows.
@@ -24,7 +29,7 @@ Requirement map
   depth then token string, single spaces.
 - Only the supplied public files are used; test rows are used only for inference (no fitting on test).
 - Determinism: fixed seeds, fixed thread count (THREADS), deterministic LightGBM, no clock reads.
-- CPU only. Measured runtime: see README (a few minutes on 4 CPU cores).
+- CPU only. Measured runtime: about 5 minutes on 4 CPU cores.
 """
 import json
 import math
