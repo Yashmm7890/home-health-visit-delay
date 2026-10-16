@@ -4,35 +4,43 @@ usage: python3 solution.py <public_dir> <submission_csv>
 
 Pipeline (everything is trained in this script on train.csv + the training rows of terms.csv):
   1. Edge models over token codes, each antisymmetric in the pair (score(a,b) = -score(b,a)):
-     a. PairLR  - logistic regression on unigram code differences x_a - x_b plus antisymmetric
-                  code-pair features (u in bag_a minus bag_b, v in bag_b minus bag_a).
-     b. UniLR   - logistic regression on unigram code differences only.
-     c. KronSVM - SVM with an antisymmetric Kronecker kernel over Tanimoto similarities of the
-                  two symmetric-difference code sets.
-     d. EmbLR   - logistic regression on differences of mean code embeddings; embeddings are a
-                  PPMI-SVD fitted on training term bags only.
+     a. PairLR      - logistic regression on unigram code differences x_a - x_b plus antisymmetric
+                      code-pair features (u in bag_a minus bag_b, v in bag_b minus bag_a).
+     b. UniLR       - logistic regression on unigram code differences only.
+     c. KronSVM     - SVM with an antisymmetric Kronecker kernel over Tanimoto similarities of the
+                      two symmetric-difference code sets.
+     d. KronEmbSVM  - KronSVM plus an antisymmetric Kronecker kernel over mean code embeddings of
+                      the symmetric differences (generalises to code pairs never seen in training).
+     e. EmbLR       - logistic regression on mean-embedding differences and their antisymmetric
+                      outer product.
+     Code embeddings are a PPMI-SVD fitted on co-occurrence inside training term bags only.
   2. Out-of-fold (5-fold, whole fragments held out) scores of these models on the training
-     fragments become features of a fragment-level CRF; test fragments are scored by the same
-     models refitted on all training fragments.
-  3. Fragment CRF: every one of the 2^k orientations of an item's k listed pairs is enumerated,
+     fragments; test fragments are scored by the same models refitted on all training fragments.
+  3. LightGBM combiner (trained on the out-of-fold scores, itself out-of-fold for training items):
+     per pair it sees the five scores, the PairLR unigram/pair decomposition and seen-pair
+     fraction, per-term context features of both endpoints (from the item's own bags + training
+     document frequencies), each model's mean score against the item's other terms, and one-hop
+     context (scores of the other pairs touching each endpoint). It is antisymmetrised by scoring
+     both orientations: s = (g(fwd) - g(bwd)) / 2.
+  4. Fragment CRF: every one of the 2^k orientations of an item's k listed pairs is enumerated,
      directed cycles are excluded, and an orientation is scored by learned weights on
-       - the edge-model scores (+ seen-fraction interactions of the PairLR decomposition),
-       - per-term context features computed from that item's own term bags only,
+       - the combiner score and the UniLR score of every pair,
        - structural features (degree categories, number of roots/sinks, 2-path motifs),
-       - per-term features x degree-category potentials.
+       - per-term context features x degree-category potentials.
      Weights are fitted by maximum likelihood on the training fragments (L-BFGS); the CRF
      L2 strength is chosen inside the script by fragment-level 5-fold CV on training items.
-  4. Each test pair is oriented by its CRF marginal (orientation probability summed over all
+  5. Each test pair is oriented by its CRF marginal (orientation probability summed over all
      acyclic orientations of the whole fragment), which is the edge-accuracy optimal decision.
 
 Requirement map:
   - Output: one row per test item, `item_id,directions`, `parent>child` joined by `;`, every
     listed pair exactly once                                   -> write_submission()
-  - Learn which tokens signal generality from training fragments -> PairLR/UniLR/KronSVM/EmbLR
+  - Learn which tokens signal generality from training fragments -> PairLR/UniLR/KronSVM/
+    KronEmbSVM/EmbLR + LightGBM combiner
   - Compare the two terms of a pair rather than scoring a term alone -> antisymmetric pair
     features / kernels in all edge models
-  - Use the fragment as a whole (consistent generality across pairs) -> fragment CRF over all
-    joint orientations, acyclicity, shared per-term potentials
+  - Use the fragment as a whole (consistent generality across pairs) -> one-hop context in the
+    combiner + fragment CRF over all joint orientations, acyclicity, shared per-term potentials
   - Term-disjoint validation holding out whole fragments           -> fragment_folds()
   - No external data, no pretrained models, no hash inversion       -> only files in public_dir
   - No pooling of statistics across test items: every test item is featurised from its own
@@ -57,6 +65,7 @@ from scipy.optimize import minimize
 from scipy.sparse.linalg import svds
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
+import lightgbm as lgb
 
 SEED = 0
 N_FOLDS = 5
@@ -64,11 +73,19 @@ PAIR_C = 1.0          # PairLR inverse L2 strength (same scale for unigram and p
 UNI_C = 1.0
 SVM_C = 1.0
 SVM_W_UNI = 0.02      # weight of the linear unigram kernel inside KronSVM
-EMB_DIM = 64
+EMB_DIM = 256
+EMB_OUTER = 64        # leading embedding dims used in the antisymmetric outer-product features
+EMB_OUTER_W = 3.0
 EMB_C = 1.0
+KEMB_W = 1.0          # weight of the embedding Kronecker kernel in KronEmbSVM
+KEMB_WL = 0.1         # weight of the linear embedding-difference kernel in KronEmbSVM
+GBM_ROUNDS = 300
+GBM_PARAMS = dict(objective='binary', learning_rate=0.03, num_leaves=15, min_data_in_leaf=40,
+                  feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+                  verbose=-1, num_threads=4, seed=0, deterministic=True, force_col_wise=True)
 CRF_L2T = 1.0         # structural weights
 CRF_L2N = 1.0         # node x degree-category weights
-CRF_L2B_GRID = [0.1, 1.0, 3.0]   # edge-feature weights, chosen by in-script CV
+CRF_L2B_GRID = [0.1, 1.0]   # edge-feature weights, chosen by in-script CV
 DEG_CAP = 3
 DF_EDGES = [0, 1, 3, 10, 30, 100, 300, 10 ** 9]
 
@@ -199,8 +216,8 @@ class PairModel:
 class KronSVM:
     """SVM with antisymmetric Kronecker kernel on Tanimoto similarity of symmetric differences."""
 
-    def __init__(self, C, w_uni):
-        self.C = C; self.w_uni = w_uni
+    def __init__(self, C, w_uni, emb=None):
+        self.C = C; self.w_uni = w_uni; self.emb = emb
 
     def _rep(self, pb, grow):
         rows = {k: ([], []) for k in ['A', 'B', 'Ad', 'Bd']}
@@ -216,7 +233,16 @@ class KronSVM:
                             continue
                         j = self.vocab[t] = len(self.vocab)
                     rows[key][0].append(i); rows[key][1].append(j)
-        return rows, {k: np.array(v, float) for k, v in sizes.items()}
+        sizes = {k: np.array(v, float) for k, v in sizes.items()}
+        if self.emb is not None:
+            ev, E = self.emb
+            ea, eb, fa, fb = [], [], [], []
+            for A, B in pb:
+                sA, sB = set(A), set(B)
+                ea.append(mean_emb(sA - sB, ev, E)); eb.append(mean_emb(sB - sA, ev, E))
+                fa.append(mean_emb(sA, ev, E)); fb.append(mean_emb(sB, ev, E))
+            sizes['emb'] = (np.array(ea), np.array(eb), np.array(fa), np.array(fb))
+        return rows, sizes
 
     def _mats(self, rows, n):
         V = len(self.vocab)
@@ -231,6 +257,10 @@ class KronSVM:
 
         K = self.w_uni * (I('A', 'A') - I('A', 'B') - I('B', 'A') + I('B', 'B'))
         K += tani('Ad', 'Ad') * tani('Bd', 'Bd') - tani('Ad', 'Bd') * tani('Bd', 'Ad')
+        if self.emb is not None:
+            a1, b1, f1, g1 = n1['emb']; a2, b2, f2, g2 = n2['emb']
+            K += KEMB_W * ((a1 @ a2.T) * (b1 @ b2.T) - (a1 @ b2.T) * (b1 @ a2.T))
+            K += KEMB_WL * ((a1 - b1) @ (a2 - b2).T + (f1 - g1) @ (f2 - g2).T)
         return K
 
     def fit(self, items):
@@ -243,7 +273,7 @@ class KronSVM:
         sv = m.support_
         self.coef = m.dual_coef_[0]
         self.Msv = {k: v[sv] for k, v in M1.items()}
-        self.nsv = {k: v[sv] for k, v in n1.items()}
+        self.nsv = {k: (v[sv] if k != 'emb' else tuple(x[sv] for x in v)) for k, v in n1.items()}
         return self
 
     def score(self, pb):
@@ -252,42 +282,48 @@ class KronSVM:
         return self._kernel(M2, n2, self.Msv, self.nsv) @ self.coef
 
 
+def fit_embedding(items, dim):
+    """PPMI-SVD code embeddings from co-occurrence inside training term bags (training items only)."""
+    vocab = {}
+    r, c = [], []
+    row = 0
+    for it in items:
+        for v in sorted(it['bags']):
+            for t in it['bags'][v]:
+                j = vocab.setdefault(t, len(vocab)); r.append(row); c.append(j)
+            row += 1
+    B = sp.csr_matrix((np.ones(len(r)), (r, c)), shape=(row, len(vocab)))
+    Cm = (B.T @ B).tocsr().astype(float)
+    Cm.setdiag(0); Cm.eliminate_zeros()
+    tot = Cm.sum(); rs = np.asarray(Cm.sum(1)).ravel()
+    Cm = Cm.tocoo()
+    pmi = np.maximum(np.log(Cm.data * tot / (rs[Cm.row] * rs[Cm.col])), 0)
+    M = sp.csr_matrix((pmi, (Cm.row, Cm.col)), shape=Cm.shape)
+    U, S, _ = svds(M, k=dim, random_state=SEED)
+    order = np.argsort(-S)
+    E = U[:, order] * np.sqrt(S[order])
+    return vocab, E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)
+
+
+def mean_emb(s, vocab, E):
+    ix = [vocab[t] for t in sorted(s) if t in vocab]
+    return E[ix].mean(0) if ix else np.zeros(E.shape[1])
+
+
 class EmbLR:
-    """LR on differences of mean PPMI-SVD code embeddings (embeddings fitted on training bags)."""
+    """LR on differences of mean PPMI-SVD code embeddings plus their antisymmetric outer product."""
 
-    def __init__(self, dim, C):
-        self.dim = dim; self.C = C
-
-    def _embed(self, items):
-        self.vocab = {}
-        r, c = [], []
-        row = 0
-        for it in items:
-            for v in sorted(it['bags']):
-                for t in it['bags'][v]:
-                    j = self.vocab.setdefault(t, len(self.vocab)); r.append(row); c.append(j)
-                row += 1
-        B = sp.csr_matrix((np.ones(len(r)), (r, c)), shape=(row, len(self.vocab)))
-        Cm = (B.T @ B).tocsr().astype(float)
-        Cm.setdiag(0); Cm.eliminate_zeros()
-        tot = Cm.sum(); rs = np.asarray(Cm.sum(1)).ravel()
-        Cm = Cm.tocoo()
-        pmi = np.maximum(np.log(Cm.data * tot / (rs[Cm.row] * rs[Cm.col])), 0)
-        M = sp.csr_matrix((pmi, (Cm.row, Cm.col)), shape=Cm.shape)
-        U, S, _ = svds(M, k=self.dim, random_state=SEED)
-        order = np.argsort(-S)
-        E = U[:, order] * np.sqrt(S[order])
-        self.E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)
+    def __init__(self, emb, C):
+        self.vocab, self.E = emb; self.C = C; self.dim = self.E.shape[1]
 
     def _feat(self, A, B):
-        def mean(s):
-            ix = [self.vocab[t] for t in sorted(s) if t in self.vocab]
-            return self.E[ix].mean(0) if ix else np.zeros(self.dim)
         sA, sB = set(A), set(B)
-        return np.r_[mean(sA - sB) - mean(sB - sA), mean(sA) - mean(sB)]
+        a = mean_emb(sA - sB, self.vocab, self.E); b = mean_emb(sB - sA, self.vocab, self.E)
+        O = np.outer(a[:EMB_OUTER], b[:EMB_OUTER]); O = O - O.T
+        iu = np.triu_indices(EMB_OUTER, 1)
+        return np.r_[a - b, mean_emb(sA, self.vocab, self.E) - mean_emb(sB, self.vocab, self.E), EMB_OUTER_W * O[iu]]
 
     def fit(self, items):
-        self._embed(items)
         pb, y = train_pairs(items)
         X = np.array([self._feat(a, b) for a, b in pb])
         m = LogisticRegression(C=self.C, fit_intercept=False, max_iter=5000)
@@ -300,10 +336,12 @@ class EmbLR:
 
 
 def fit_edge_models(tr_items):
+    emb = fit_embedding(tr_items, EMB_DIM)
     return dict(pair=PairModel(PAIR_C, None).fit(tr_items),
                 uni=PairModel(UNI_C, {'u'}).fit(tr_items),
                 svm=KronSVM(SVM_C, SVM_W_UNI).fit(tr_items),
-                emb=EmbLR(EMB_DIM, EMB_C).fit(tr_items))
+                kemb=KronSVM(SVM_C, SVM_W_UNI, emb).fit(tr_items),
+                emb=EmbLR(emb, EMB_C).fit(tr_items))
 
 
 def score_items(models, its):
@@ -315,7 +353,7 @@ def score_items(models, its):
             pb = [(it['bags'][a], it['bags'][b]) for a, b in pairs]
             s_pair, s_uni_part, seen = models['pair'].score(pb)
             s_uni = models['uni'].score(pb)[0]
-            cols = [s_pair, s_uni, models['svm'].score(pb), models['emb'].score(pb)]
+            cols = [s_pair, s_uni, models['svm'].score(pb), models['kemb'].score(pb), models['emb'].score(pb)]
             res[name] = np.stack(cols, 1)
             if name == 'edge':
                 res['decomp'] = (s_uni_part, s_pair - s_uni_part, seen)
@@ -380,15 +418,56 @@ def ctx_feats(it, la):
     return np.array(Z)[:, None], G
 
 
-def crf_inputs(it, sc, H):
-    ns = sorted(it['bags'])
+def gbm_feats(it, sc, H):
+    """per-edge features for the LightGBM combiner, in both orientations (fwd: first listed as parent).
+    Antisymmetric columns are negated and endpoint columns swapped for the reverse orientation."""
+    k = len(it['pairs'])
+    Ecols = sc['edge']
     uu, pp, ff = sc['decomp']
-    parts = [sc['edge'], np.c_[uu, pp, pp * ff, uu * ff], np.array([H[a] - H[b] for a, b in it['pairs']])]
-    hcols = [np.array([H[v] for v in ns])]
+    anti = [Ecols, np.c_[uu, pp]]
+    ga, gb = [], []
+    ns = sorted(it['bags']); nidx = {v: q for q, v in enumerate(ns)}
     for c in range(sc['all'].shape[1]):
         zc, G = ctx_feats(it, sc['all'][:, c])
-        parts.append(zc); hcols.append(G[:, None])
-    return np.concatenate(parts, 1), np.concatenate(hcols + [np.ones((len(ns), 1))], 1)
+        anti.append(zc)
+        ga.append(np.array([[G[nidx[a]]] for a, b in it['pairs']]))
+        gb.append(np.array([[G[nidx[b]]] for a, b in it['pairs']]))
+    sym = np.c_[ff, np.tile([k / 10.0, len(ns) / 8.0], (k, 1))]
+    nbr = collections.defaultdict(list)
+    for e, (a, b) in enumerate(it['pairs']):
+        nbr[a].append((e, 1.0)); nbr[b].append((e, -1.0))
+
+    def hop(v, excl):
+        lst = [(e, sg) for e, sg in nbr[v] if e != excl]
+        if not lst:
+            return np.r_[np.zeros(2 * Ecols.shape[1]), 0.0]
+        M = np.array([Ecols[e] * sg for e, sg in lst])
+        return np.r_[M.mean(0), M.max(0), len(lst)]
+
+    ha = np.array([np.r_[H[a], hop(a, e)] for e, (a, b) in enumerate(it['pairs'])])
+    hb = np.array([np.r_[H[b], hop(b, e)] for e, (a, b) in enumerate(it['pairs'])])
+    A = np.concatenate(anti, 1)
+    PA = np.concatenate([ha] + ga, 1); PB = np.concatenate([hb] + gb, 1)
+    return np.c_[A, sym, PA, PB], np.c_[-A, sym, PB, PA]
+
+
+def gbm_fit(feats_list, items_list):
+    X, y = [], []
+    for (fw, bw), it in zip(feats_list, items_list):
+        g = labels(it).astype(float)
+        X += [fw, bw]; y += [g, 1 - g]
+    return lgb.train(GBM_PARAMS, lgb.Dataset(np.concatenate(X), np.concatenate(y)), num_boost_round=GBM_ROUNDS)
+
+
+def gbm_score(m, fw, bw):
+    return (m.predict(fw, raw_score=True) - m.predict(bw, raw_score=True)) / 2
+
+
+def crf_inputs(it, gbm_s, sc, H):
+    ns = sorted(it['bags'])
+    Z = np.c_[gbm_s, sc['edge'][:, 1]]  # combiner score + unigram LR score
+    Hm = np.c_[np.array([H[v] for v in ns]), np.ones((len(ns), 1))]
+    return Z, Hm
 
 
 # ------------------------------------------------------------------------------ fragment CRF
@@ -527,12 +606,29 @@ def main(D, out_path):
     tsc = score_items(models, titems)
     print('edge models refitted on all training fragments', flush=True)
 
-    # 3. CRF inputs
+    # 3. LightGBM combiner over edge-model scores + per-term context (out-of-fold on training items)
     df = item_df(items)
+    HN = [node_feats(it, df, True) for it in items]
+    HT = [node_feats(it, df, False) for it in titems]
+    GF = [gbm_feats(it, oof[i], HN[i]) for i, it in enumerate(items)]
+    GFT = [gbm_feats(it, tsc[i], HT[i]) for i, it in enumerate(titems)]
+    gbm_oof = [None] * n
+    for fo in range(N_FOLDS):
+        tr = [i for i in range(n) if f[i] != fo]
+        m = gbm_fit([GF[i] for i in tr], [items[i] for i in tr])
+        for i in range(n):
+            if f[i] == fo:
+                gbm_oof[i] = gbm_score(m, *GF[i])
+    acc = np.mean(np.concatenate([(gbm_oof[i] >= 0) == labels(items[i]) for i in range(n)]))
+    print(f'LightGBM combiner OOF edge score {2 * acc - 1:.4f}', flush=True)
+    m = gbm_fit(GF, items)
+    gbm_test = [gbm_score(m, *GFT[i]) for i in range(len(titems))]
+
+    # 4. CRF inputs
     E = [enumerate_item(it) for it in items]
-    ZH = [crf_inputs(it, oof[i], node_feats(it, df, True)) for i, it in enumerate(items)]
+    ZH = [crf_inputs(it, gbm_oof[i], oof[i], HN[i]) for i, it in enumerate(items)]
     ET = [enumerate_item(it) for it in titems]
-    ZHT = [crf_inputs(it, tsc[i], node_feats(it, df, False)) for i, it in enumerate(titems)]
+    ZHT = [crf_inputs(it, gbm_test[i], tsc[i], HT[i]) for i, it in enumerate(titems)]
 
     # in-script CV for the CRF edge-weight L2 (fragment-level folds)
     f2 = fragment_folds(n, N_FOLDS, SEED + 1)
@@ -550,7 +646,7 @@ def main(D, out_path):
             best = (acc, l2b)
     print(f'chosen l2b={best[1]}', flush=True)
 
-    # 4. final CRF on all training fragments -> test marginals
+    # 5. final CRF on all training fragments -> test marginals
     x = crf_fit(Batch(E, [z for z, h in ZH], [h for z, h in ZH]), best[1])
     tm = crf_marginals(x, Batch(ET, [z for z, h in ZHT], [h for z, h in ZHT]))
     sub = write_submission(te, titems, tm, out_path)
