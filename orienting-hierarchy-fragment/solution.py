@@ -7,17 +7,21 @@ Pipeline (everything is trained in this script on train.csv + the training rows 
      a. PairLR      - logistic regression on unigram code differences x_a - x_b plus antisymmetric
                       code-pair features (u in bag_a minus bag_b, v in bag_b minus bag_a).
      b. UniLR       - logistic regression on unigram code differences only.
-     c. KronSVM     - SVM with an antisymmetric Kronecker kernel over Tanimoto similarities of the
-                      two symmetric-difference code sets.
-     d. KronEmbSVM  - KronSVM plus an antisymmetric Kronecker kernel over mean code embeddings of
-                      the symmetric differences (generalises to code pairs never seen in training).
-     e. EmbLR       - logistic regression on mean-embedding differences and their antisymmetric
-                      outer product.
-     Code embeddings are a PPMI-SVD fitted on co-occurrence inside training term bags only.
+     c. KronSVM     - SVM with an antisymmetric Kronecker kernel over idf-weighted Tanimoto
+                      similarities of the two symmetric-difference code sets.
+     d. KronEmbSVM  - KronSVM plus an antisymmetric Kronecker kernel over mean 512-d code embeddings
+                      of the symmetric differences (generalises to code pairs never seen in training).
+     e. EmbLR       - logistic regression on mean 256-d embedding differences and their
+                      antisymmetric outer product.
+     f. KNNVote(td) - instance-based analog vote: softmax-weighted forward-vs-backward Kronecker
+                      similarity to every oriented training relation (idf-weighted Tanimoto).
+     g. KNNVote(emb)- the same vote with cosine similarity of idf-weighted mean embeddings.
+     Code embeddings are a PPMI-SVD and idf weights are document frequencies, both fitted on
+     training term bags only.
   2. Out-of-fold (5-fold, whole fragments held out) scores of these models on the training
      fragments; test fragments are scored by the same models refitted on all training fragments.
   3. LightGBM combiner (trained on the out-of-fold scores, itself out-of-fold for training items):
-     per pair it sees the five scores, the PairLR unigram/pair decomposition and seen-pair
+     per pair it sees the seven scores, the PairLR unigram/pair decomposition and seen-pair
      fraction, per-term context features of both endpoints (from the item's own bags + training
      document frequencies), each model's mean score against the item's other terms, and one-hop
      context (scores of the other pairs touching each endpoint). It is antisymmetrised by scoring
@@ -36,7 +40,7 @@ Requirement map:
   - Output: one row per test item, `item_id,directions`, `parent>child` joined by `;`, every
     listed pair exactly once                                   -> write_submission()
   - Learn which tokens signal generality from training fragments -> PairLR/UniLR/KronSVM/
-    KronEmbSVM/EmbLR + LightGBM combiner
+    KronEmbSVM/EmbLR/KNNVote + LightGBM combiner
   - Compare the two terms of a pair rather than scoring a term alone -> antisymmetric pair
     features / kernels in all edge models
   - Use the fragment as a whole (consistent generality across pairs) -> one-hop context in the
@@ -77,8 +81,10 @@ EMB_DIM = 256
 EMB_OUTER = 64        # leading embedding dims used in the antisymmetric outer-product features
 EMB_OUTER_W = 3.0
 EMB_C = 1.0
-KEMB_W = 1.0          # weight of the embedding Kronecker kernel in KronEmbSVM
+KEMB_DIM = 512       # embedding size used inside KronEmbSVM
+KEMB_W = 2.0          # weight of the embedding Kronecker kernel in KronEmbSVM
 KEMB_WL = 0.1         # weight of the linear embedding-difference kernel in KronEmbSVM
+KNN_TAU = 0.04        # softmax temperature of the analog-edge vote
 GBM_ROUNDS = 300
 GBM_PARAMS = dict(objective='binary', learning_rate=0.03, num_leaves=15, min_data_in_leaf=40,
                   feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
@@ -216,16 +222,20 @@ class PairModel:
 class KronSVM:
     """SVM with antisymmetric Kronecker kernel on Tanimoto similarity of symmetric differences."""
 
-    def __init__(self, C, w_uni, emb=None):
-        self.C = C; self.w_uni = w_uni; self.emb = emb
+    def __init__(self, C, w_uni, emb=None, idf=None, w_emb=KEMB_W, w_embl=KEMB_WL):
+        self.C = C; self.w_uni = w_uni; self.emb = emb; self.idf = idf
+        self.w_emb = w_emb; self.w_embl = w_embl
 
     def _rep(self, pb, grow):
         rows = {k: ([], []) for k in ['A', 'B', 'Ad', 'Bd']}
         sizes = {k: [] for k in rows}
+        wsz = {k: [] for k in rows}
         for i, (A, B) in enumerate(pb):
             sA, sB = set(A), set(B)
             for key, s in [('A', sA), ('B', sB), ('Ad', sA - sB), ('Bd', sB - sA)]:
                 sizes[key].append(len(s))
+                if self.idf is not None:
+                    wsz[key].append(sum(idf_weight(self.idf, t) for t in sorted(s)))
                 for t in sorted(s):
                     j = self.vocab.get(t)
                     if j is None:
@@ -234,6 +244,8 @@ class KronSVM:
                         j = self.vocab[t] = len(self.vocab)
                     rows[key][0].append(i); rows[key][1].append(j)
         sizes = {k: np.array(v, float) for k, v in sizes.items()}
+        if self.idf is not None:
+            sizes['w'] = {k: np.array(v, float) for k, v in wsz.items()}
         if self.emb is not None:
             ev, E = self.emb
             ea, eb, fa, fb = [], [], [], []
@@ -252,6 +264,9 @@ class KronSVM:
         I = lambda a, b: (M1[a] @ M2[b].T).toarray()
 
         def tani(a, b):
+            if self.idf is not None:  # idf-weighted Tanimoto
+                x = ((M1[a] @ self.Wd) @ M2[b].T).toarray()
+                return x / np.maximum(n1['w'][a][:, None] + n2['w'][b][None, :] - x, 1e-9)
             x = I(a, b)
             return x / np.maximum(n1[a][:, None] + n2[b][None, :] - x, 1)
 
@@ -259,8 +274,8 @@ class KronSVM:
         K += tani('Ad', 'Ad') * tani('Bd', 'Bd') - tani('Ad', 'Bd') * tani('Bd', 'Ad')
         if self.emb is not None:
             a1, b1, f1, g1 = n1['emb']; a2, b2, f2, g2 = n2['emb']
-            K += KEMB_W * ((a1 @ a2.T) * (b1 @ b2.T) - (a1 @ b2.T) * (b1 @ a2.T))
-            K += KEMB_WL * ((a1 - b1) @ (a2 - b2).T + (f1 - g1) @ (f2 - g2).T)
+            K += self.w_emb * ((a1 @ a2.T) * (b1 @ b2.T) - (a1 @ b2.T) * (b1 @ a2.T))
+            K += self.w_embl * ((a1 - b1) @ (a2 - b2).T + (f1 - g1) @ (f2 - g2).T)
         return K
 
     def fit(self, items):
@@ -268,18 +283,131 @@ class KronSVM:
         self.vocab = {}
         rows, n1 = self._rep(pb, True)
         M1 = self._mats(rows, len(pb))
+        if self.idf is not None:
+            wv = np.zeros(len(self.vocab))
+            for t, j in self.vocab.items():
+                wv[j] = idf_weight(self.idf, t)
+            self.Wd = sp.diags(wv)
         m = SVC(C=self.C, kernel='precomputed')
         m.fit(self._kernel(M1, n1, M1, n1), 2 * y - 1)
         sv = m.support_
         self.coef = m.dual_coef_[0]
         self.Msv = {k: v[sv] for k, v in M1.items()}
-        self.nsv = {k: (v[sv] if k != 'emb' else tuple(x[sv] for x in v)) for k, v in n1.items()}
+        self.nsv = {}
+        for k, v in n1.items():
+            if k == 'emb':
+                self.nsv[k] = tuple(x[sv] for x in v)
+            elif k == 'w':
+                self.nsv[k] = {kk: vv[sv] for kk, vv in v.items()}
+            else:
+                self.nsv[k] = v[sv]
         return self
 
     def score(self, pb):
         rows, n2 = self._rep(pb, False)
         M2 = self._mats(rows, len(pb))
         return self._kernel(M2, n2, self.Msv, self.nsv) @ self.coef
+
+
+def fit_idf(items):
+    """inverse document frequency over training term bags: log((N+1)/(df+1)); unseen codes get df=0."""
+    df = collections.Counter()
+    N = 0
+    for it in items:
+        for v in sorted(it['bags']):
+            df.update(set(it['bags'][v])); N += 1
+    return (dict(df), N)
+
+
+def idf_weight(idf, t):
+    df, N = idf
+    return float(np.log((N + 1) / (df.get(t, 0) + 1)))
+
+
+class KNNVote:
+    """Instance-based analog vote: compares a pair (A,B) with every oriented training relation (P>C)
+    by the Kronecker similarity sim(A,P)sim(B,C) (forward) vs sim(A,C)sim(B,P) (backward) and returns a
+    softmax-weighted vote. mode 'td': idf-weighted Tanimoto of symmetric differences; mode 'emb': cosine
+    of idf-weighted mean embeddings of symmetric differences. Training relations only."""
+
+    def __init__(self, mode, idf, emb=None, tau=KNN_TAU):
+        self.mode = mode; self.idf = idf; self.emb = emb; self.tau = tau
+
+    def _rep(self, pb, grow):
+        n = len(pb)
+        out = {}
+        for key in ['Ad', 'Bd']:
+            r, c, v, sz = [], [], [], []
+            E = []
+            for i, (A, B) in enumerate(pb):
+                sA, sB = set(A), set(B)
+                S = sorted(sA - sB) if key == 'Ad' else sorted(sB - sA)
+                ws = [idf_weight(self.idf, t) for t in S]
+                sz.append(sum(ws))
+                if self.mode == 'emb':
+                    ev, Em = self.emb
+                    e = np.zeros(Em.shape[1])
+                    for t, w in zip(S, ws):
+                        if t in ev:
+                            e += w * Em[ev[t]]
+                    E.append(e / (np.linalg.norm(e) + 1e-9))
+                for t, w in zip(S, ws):
+                    j = self.vocab.get(t)
+                    if j is None:
+                        if not grow:
+                            continue
+                        j = self.vocab[t] = len(self.vocab)
+                    r.append(i); c.append(j); v.append(w)
+            out[key] = (r, c, v, np.array(sz))
+            if self.mode == 'emb':
+                out['e' + key] = np.array(E)
+        return out
+
+    def _mats(self, rep, n, binary):
+        V = len(self.vocab)
+        R = {}
+        for key in ['Ad', 'Bd']:
+            r, c, v, sz = rep[key]
+            vals = np.ones(len(r)) if binary else np.array(v, float)
+            R[key] = sp.csr_matrix((vals, (r, c)), shape=(n, V))
+            R['n' + key] = sz
+            if 'e' + key in rep:
+                R['e' + key] = rep['e' + key]
+        return R
+
+    def fit(self, items):
+        pb = []
+        for it in items:
+            for p in it['pairs']:
+                par = it['gold'][p]; ch = p[1] if par == p[0] else p[0]
+                pb.append((it['bags'][par], it['bags'][ch]))
+        self.vocab = {}
+        rep = self._rep(pb, True)
+        self.Rt = self._mats(rep, len(pb), True)
+        return self
+
+    def _sims(self, Rv):
+        Rt = self.Rt
+        if self.mode == 'emb':
+            c = lambda x, y: np.maximum(Rv['e' + x] @ Rt['e' + y].T, 0)
+            return c('Ad', 'Ad') * c('Bd', 'Bd'), c('Ad', 'Bd') * c('Bd', 'Ad')
+
+        def tani(x, y):
+            I = (Rv[x] @ Rt[y].T).toarray()
+            return I / np.maximum(Rv['n' + x][:, None] + Rt['n' + y][None, :] - I, 1e-9)
+
+        return tani('Ad', 'Ad') * tani('Bd', 'Bd'), tani('Ad', 'Bd') * tani('Bd', 'Ad')
+
+    def score(self, pb):
+        out = np.zeros(len(pb))
+        for st in range(0, len(pb), 500):
+            chunk = pb[st:st + 500]
+            Rv = self._mats(self._rep(chunk, False), len(chunk), False)
+            f, b = self._sims(Rv)
+            M = np.c_[f, b]
+            w = np.exp((M - M.max(1, keepdims=True)) / self.tau)
+            out[st:st + len(chunk)] = 5 * (w[:, :f.shape[1]].sum(1) - w[:, f.shape[1]:].sum(1)) / w.sum(1)
+        return out
 
 
 def fit_embedding(items, dim):
@@ -337,11 +465,15 @@ class EmbLR:
 
 def fit_edge_models(tr_items):
     emb = fit_embedding(tr_items, EMB_DIM)
+    emb_k = fit_embedding(tr_items, KEMB_DIM)
+    idf = fit_idf(tr_items)
     return dict(pair=PairModel(PAIR_C, None).fit(tr_items),
                 uni=PairModel(UNI_C, {'u'}).fit(tr_items),
-                svm=KronSVM(SVM_C, SVM_W_UNI).fit(tr_items),
-                kemb=KronSVM(SVM_C, SVM_W_UNI, emb).fit(tr_items),
-                emb=EmbLR(emb, EMB_C).fit(tr_items))
+                svm=KronSVM(SVM_C, SVM_W_UNI, idf=idf).fit(tr_items),
+                kemb=KronSVM(SVM_C, SVM_W_UNI, emb_k, idf=idf).fit(tr_items),
+                emb=EmbLR(emb, EMB_C).fit(tr_items),
+                knn=KNNVote('td', idf).fit(tr_items),
+                knne=KNNVote('emb', idf, emb).fit(tr_items))
 
 
 def score_items(models, its):
@@ -353,7 +485,8 @@ def score_items(models, its):
             pb = [(it['bags'][a], it['bags'][b]) for a, b in pairs]
             s_pair, s_uni_part, seen = models['pair'].score(pb)
             s_uni = models['uni'].score(pb)[0]
-            cols = [s_pair, s_uni, models['svm'].score(pb), models['kemb'].score(pb), models['emb'].score(pb)]
+            cols = [s_pair, s_uni, models['svm'].score(pb), models['kemb'].score(pb), models['emb'].score(pb),
+                    models['knn'].score(pb), models['knne'].score(pb)]
             res[name] = np.stack(cols, 1)
             if name == 'edge':
                 res['decomp'] = (s_uni_part, s_pair - s_uni_part, seen)
