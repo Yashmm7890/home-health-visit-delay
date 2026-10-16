@@ -1,0 +1,1049 @@
+"""ShardFit: Archaeological Refit Neighborhood Completion - end-to-end solution (v3b).
+
+usage: python3 solution_v3b.py <public_dataset_dir> <submission_csv_path>
+
+Requirement map (challenge text -> implementation)
+- "estimate query-card compatibility for every candidate": case_feats(), fx_extra_feats() - per-card evidence
+  from the query card and the twelve row-local cards: distance / bearing / height / year bands, shared layer,
+  object / production-code agreement with the query, masks, within-case ranks and counts, approximate planar
+  geometry from (d, b) and distances between cards. Handles c00..c11 and the s carrier are never features.
+- "revise those local estimates using the visible candidate-induced graph": visible degree, typed witness
+  degrees, witness-neighbour summaries, hidden-edge evidence (visible degree / relation histogram minus typed
+  witness degree), witness-component competition (fx_extra3); stage-2 models re-score every card from the
+  stage-1 probabilities of its witness neighbours, its component and the other cards (stack_feats,
+  fx_ctx_feats) - typed message passing, graph summaries and cross-card competition.
+- Pair statistics learned from training cases only: nested out-of-fold target encodings of (query p, card p)
+  keys (fx_te_features) and label-free witness p-pair edge-type rates (fx_wit_pair_feats).
+- Models trained in this script on train.csv only (LightGBM, multiclass [none, R0, R1, R2] per candidate):
+  stack = train_stage1 -> train_stage2; feat = train_feat (stage 1 out-of-fold for train, all-train model for
+  test, contextual stage 2 over 3 fixed seeds). Vocabularies, encodings and statistics come from train only.
+- Ensemble: equal-weight geometric mean of the two stage-2 test probability sets.
+- "neighbourhood-size calibration, and constrained decoding ... one legal neighborhood delta": eu_decode()
+  picks per case the number of incident edges (1..6) and their relation families by maximising the expected
+  official score (expected Dice, expected Levenshtein fidelity, linearised pooled per-relation F1); class rates
+  and F1 operating points are estimated from training labels and out-of-fold predictions.
+- Output: 1-6 tokens cNN:Rk sorted by handle (program()), never NONE; every test id once.
+- Determinism: fixed seeds and fold seeds, THREADS = 1, deterministic LightGBM, seeded Monte Carlo, no clock.
+  CPU only.
+"""
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+THREADS = 1
+os.environ['OMP_NUM_THREADS'] = str(THREADS)
+os.environ['MKL_NUM_THREADS'] = str(THREADS)
+os.environ['OPENBLAS_NUM_THREADS'] = str(THREADS)
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+SEED = 0
+W_A, W_B, W_C = 0.45, 0.35, 0.20
+RELS = ['R0', 'R1', 'R2']
+QFIELDS = ['o', 'p', 'l', 'e']
+CARD_RE = re.compile(r'(c\d\d)\[([^\]]*)\]')
+WT = ['R0', 'R1', 'R2', 'RX']
+PRM1 = dict(objective='multiclass', num_class=4, learning_rate=0.03, num_leaves=31, min_data_in_leaf=30, feature_fraction=0.7,
+            bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1, num_threads=THREADS, seed=SEED,
+            deterministic=True, force_col_wise=True)
+PRM2 = dict(objective="multiclass", num_class=4, learning_rate=0.03, num_leaves=7, min_data_in_leaf=40, feature_fraction=0.8,
+            bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, verbose=-1, num_threads=THREADS, seed=SEED, deterministic=True)
+ROUNDS1, ROUNDS2 = 500, 400
+EU_SAMPLES = 128
+
+
+# ----------------------------------------------------------------------------- parsing
+
+
+def parse_query(q):
+    parts = q.strip('[]').split(',')
+    out = {}
+    for name, t in zip(QFIELDS, parts):
+        out[name] = 'M' if t == 'M' else t[1:]
+    return out
+
+
+def parse_cards(s):
+    cards = []
+    for m in CARD_RE.finditer(s):
+        f = {}
+        for t in m.group(2).split(','):
+            f[t[0]] = t[1:]
+        cards.append(f)
+    assert len(cards) == 12
+    return cards
+
+
+def parse_witness(w):
+    """list of (i, j, rel) with rel in R0/R1/R2/RX."""
+    if w == 'NO_WITNESS':
+        return []
+    out = []
+    for e in w.split(' '):
+        a, r, b = e.split('-')
+        out.append((int(a[1:]), int(b[1:]), r))
+    return out
+
+
+def parse_program(s):
+    """-> dict cand -> rel index (0..2)."""
+    if s == 'NONE':
+        return {}
+    out = {}
+    for t in s.split(' '):
+        c, r = t.split(':')
+        out[int(c[1:])] = RELS.index(r)
+    return out
+
+
+def labels_from_programs(progs):
+    Y = np.zeros((len(progs), 12), int)  # 0 none, 1..3 = R0..R2
+    for i, s in enumerate(progs):
+        for c, r in parse_program(s).items():
+            Y[i, c] = r + 1
+    return Y
+
+
+def folds(n, k=5, seed=0):
+    rng = np.random.RandomState(seed)
+    f = np.zeros(n, int)
+    f[rng.permutation(n)] = np.arange(n) % k
+    return f
+
+
+# ----------------------------------------------------------------------------- stage-1 features
+
+
+def zval(z):
+    if z in ('M', 'X'):
+        return np.nan
+    if z == '0':
+        return 0.0
+    return float(z[1:]) * (1 if z[0] == 'P' else -1)
+
+
+def num(v):
+    try:
+        return float(v)
+    except ValueError:
+        return np.nan
+
+
+def case_feats(case, vocab):
+    q, cards, wit = case['q'], case['cards'], case['wit']
+    n = 12
+    F = {}
+    d = np.array([num(c['d']) for c in cards])
+    y = np.array([num(c['y']) for c in cards])
+    v = np.array([num(c['v']) for c in cards])
+    z = np.array([zval(c['z']) for c in cards])
+    h = np.array([[num(c['h'][k]) if c['h'] not in ('M', 'X') else np.nan for k in range(3)] for c in cards])
+    F['d'] = d; F['y'] = y; F['v'] = v; F['z'] = z; F['absz'] = np.abs(z)
+    F['h0'] = h[:, 0]; F['h1'] = h[:, 1]; F['h2'] = h[:, 2]
+    for k in ['d', 'b', 'z', 'y', 'l', 'o', 'p', 'v', 'h']:
+        F['m_' + k] = np.array([c[k] == 'M' for c in cards], float)
+    F['nmask'] = sum(F['m_' + k] for k in ['d', 'b', 'z', 'y', 'l', 'o', 'p', 'v', 'h'])
+    for k in ['b', 'o', 'p', 'l']:
+        F['c_' + k] = np.array([vocab[k].get(c[k], -1) for c in cards], float)
+    F['c_z'] = np.array([vocab['z'].get(c['z'], -1) for c in cards], float)
+    for k in ['o', 'p', 'l', 'e']:
+        F['q_' + k] = np.full(n, vocab['q' + k].get(q[k], -1), float)
+    # query matches
+    F['same_o'] = np.array([np.nan if (c['o'] == 'M' or q['o'] == 'M') else float(c['o'] == q['o']) for c in cards])
+    F['same_p'] = np.array([np.nan if (c['p'] == 'M' or q['p'] == 'M') else float(c['p'] == q['p']) for c in cards])
+    # within-case ranks / counts
+    dd = np.where(np.isnan(d), 99, d)
+    F['d_rank'] = np.array([(dd < dd[i]).sum() for i in range(n)], float)
+    F['d_rank_eq'] = np.array([(dd == dd[i]).sum() for i in range(n)], float)
+    F['d_min_case'] = np.full(n, np.nanmin(d) if np.isfinite(d).any() else np.nan)
+    F['d_minus_min'] = d - F['d_min_case']
+    yy = np.where(np.isnan(y), 99, y)
+    F['y_rank'] = np.array([(yy < yy[i]).sum() for i in range(n)], float)
+    ps = [c['p'] for c in cards]
+    F['n_same_p_in_case'] = np.array([sum(1 for x in ps if x == p and p != 'M') for p in ps], float)
+    F['n_qp_in_case'] = np.full(n, sum(1 for x in ps if x == q['p'] and x != 'M'))
+    F['n_v_pos_case'] = np.full(n, float(np.nansum(v > 0)))
+    # bearing agreement with others (same sector count)
+    bs = [c['b'] for c in cards]
+    F['n_same_b'] = np.array([sum(1 for x in bs if x == b and b not in ('M', 'X')) for b in bs], float)
+    # witness graph
+    deg = np.zeros(n); degr = np.zeros((n, 4))
+    adj = [[] for _ in range(n)]
+    for a, b, r in wit:
+        ri = ['R0', 'R1', 'R2', 'RX'].index(r)
+        deg[a] += 1; deg[b] += 1; degr[a, ri] += 1; degr[b, ri] += 1
+        adj[a].append((b, ri)); adj[b].append((a, ri))
+    F['wdeg'] = deg
+    for k, nm in enumerate(['R0', 'R1', 'R2', 'RX']):
+        F['wdeg_' + nm] = degr[:, k]
+    F['n_wit'] = np.full(n, len(wit), float)
+    # witness-neighbour summaries
+    F['nb_min_d'] = np.array([np.nanmin([d[j] for j, _ in adj[i]]) if adj[i] and np.isfinite([d[j] for j, _ in adj[i]]).any() else np.nan for i in range(n)])
+    F['nb_samep'] = np.array([sum(1 for j, _ in adj[i] if cards[j]['p'] == q['p'] and q['p'] != 'M') for i in range(n)], float)
+    F['nb_drank_min'] = np.array([min([F['d_rank'][j] for j, _ in adj[i]]) if adj[i] else np.nan for i in range(n)])
+    # connected component size in witness graph
+    comp = -np.ones(n, int); cid = 0
+    for s in range(n):
+        if comp[s] >= 0:
+            continue
+        st = [s]; comp[s] = cid
+        while st:
+            u = st.pop()
+            for w_, _ in adj[u]:
+                if comp[w_] < 0:
+                    comp[w_] = cid; st.append(w_)
+        cid += 1
+    sizes = np.bincount(comp)
+    F['wcomp_size'] = sizes[comp].astype(float)
+    F['wcomp_min_d'] = np.array([np.nanmin(np.where(comp == comp[i], d, np.nan)) if np.isfinite(np.where(comp == comp[i], d, np.nan)).any() else np.nan for i in range(n)])
+    names = sorted(F)
+    X = np.stack([np.asarray(F[k], float) for k in names], 1)
+    return X, names
+
+
+def build_vocab(case_lists):
+    vocab = {k: {} for k in ['b', 'z', 'o', 'p', 'l', 'qo', 'qp', 'ql', 'qe']}
+    for cases in case_lists:
+        for c in cases:
+            for card in c['cards']:
+                for k in ['b', 'z', 'o', 'p', 'l']:
+                    vocab[k].setdefault(card[k], len(vocab[k]))
+            for k in ['o', 'p', 'l', 'e']:
+                vocab['q' + k].setdefault(c['q'][k], len(vocab['q' + k]))
+    return vocab
+
+
+def build(cases, vocab):
+    Xs = []
+    for c in cases:
+        X, names = case_feats(c, vocab)
+        Xs.append(X)
+    return np.stack(Xs), names  # (n_cases, 12, F)
+
+
+# ----------------------------------------------------------------------------- stage-2 graph context
+
+
+def adj_tensor(cases):
+    A = np.zeros((len(cases), 4, 12, 12))
+    for i, c in enumerate(cases):
+        for a, b, r in c['wit']:
+            k = WT.index(r)
+            A[i, k, a, b] = 1; A[i, k, b, a] = 1
+    return A
+
+
+def comp_matrix(A):
+    """same-component indicator (n,12,12) excluding self."""
+    Au = (A.sum(1) > 0).astype(float)
+    R = Au + np.eye(12)[None]
+    for _ in range(4):
+        R = ((R @ R) > 0).astype(float)
+    return R - np.eye(12)[None]
+
+
+def stack_feats(P, A, Comp, Xraw=None, hop2=False):
+    n = len(P)
+    lp = np.log(np.clip(P, 1e-9, 1))
+    pe = 1 - P[:, :, 0]
+    q = P[:, :, 1:]
+    F = [lp[:, :, 1:] - lp[:, :, :1], pe[..., None], q / np.maximum(pe[..., None], 1e-9)]
+    rank = np.argsort(np.argsort(-pe, 1, kind='stable'), 1)
+    mx = pe.max(1, keepdims=True)
+    srt = -np.sort(-pe, 1)
+    F += [rank[..., None], (pe / mx)[..., None], (pe - mx)[..., None], np.repeat(pe.sum(1, keepdims=True), 12, 1)[..., None],
+          (pe.sum(1, keepdims=True) - pe)[..., None], np.repeat(srt[:, :4], 12, 0).reshape(n, 12, 4) if False else np.repeat(srt[:, None, :4], 12, 1)]
+    Au = (A.sum(1) > 0).astype(float)
+    deg = Au.sum(2)
+    F.append(deg[..., None])
+    for M in [Au] + [A[:, k] for k in range(4)]:
+        nbmax = np.where(M > 0, pe[:, None, :], -1).max(2)
+        nbsum = (M * pe[:, None, :]).sum(2)
+        F += [nbmax[..., None], nbsum[..., None]]
+    for r in range(3):
+        F.append(np.where(Au > 0, q[:, None, :, r], -1).max(2)[..., None])
+    cm = np.where(Comp > 0, pe[:, None, :], -1).max(2)
+    F += [cm[..., None], (Comp * pe[:, None, :]).sum(2)[..., None], Comp.sum(2)[..., None]]
+    if hop2:
+        A2 = ((Au @ Au) > 0).astype(float) * (1 - Au) * (1 - np.eye(12)[None])
+        F += [np.where(A2 > 0, pe[:, None, :], -1).max(2)[..., None], (A2 * pe[:, None, :]).sum(2)[..., None],
+              ((Au * (pe[:, None, :] > 0.5)).sum(2))[..., None],
+              np.where(Au > 0, rank[:, None, :], 12).min(2)[..., None]]
+        # neighbour type posterior weighted by neighbour edge prob
+        tau = q / np.maximum(pe[..., None], 1e-9)
+        wsum = (Au * pe[:, None, :]).sum(2, keepdims=True)
+        F.append(np.einsum('nij,nj,njr->nir', Au, pe, tau) / np.maximum(wsum, 1e-9))
+    if Xraw is not None:
+        F.append(Xraw)
+    return np.concatenate(F, 2)
+
+
+# ----------------------------------------------------------------------------- feat model: evidence features
+# per-candidate evidence features = case_feats() + fx_extra_feats() (object-code context, hidden-edge excess,
+# RX type inference, same-code ranks, approximate geometry, typed witness-neighbour summaries) + fx_extra3()
+# (component competition on the witness graph and on the hidden-edge-augmented graph). Never handles, never s.
+
+FX_RI = {'R0': 0, 'R1': 1, 'R2': 2, 'RX': 3}
+
+
+def fx_rank_in(vals, mask):
+    """rank of vals[i] among vals[mask] (strictly less count); nan if not mask[i]."""
+    out = np.full(len(vals), np.nan)
+    vv = np.where(np.isnan(vals), 99, vals)
+    for i in range(len(vals)):
+        if mask[i]:
+            out[i] = ((vv < vv[i]) & mask).sum()
+    return out
+
+
+def fx_extra_feats(case, vocab):
+    q, cards, wit = case['q'], case['cards'], case['wit']
+    n = 12
+    F = {}
+    d = np.array([num(c['d']) for c in cards])
+    b = np.array([num(c['b']) for c in cards])
+    z = np.array([zval(c['z']) for c in cards])
+    v = np.array([num(c['v']) for c in cards])
+    hm = np.array([c['h'] in ('M', 'X') for c in cards])
+    h = np.array([[np.nan] * 3 if c['h'] in ('M', 'X') else [float(c['h'][k]) for k in range(3)] for c in cards])
+    os_ = [c['o'] for c in cards]; ps = [c['p'] for c in cards]
+    # ---- object code context: a masked query object code is imputed as the most frequent non-O01 card code
+    # (count ties -> lexicographically smallest code; iteration over sorted codes keeps it hash-seed independent)
+    non1 = [o for o in os_ if o not in ('M', 'O01')]
+    qo = q['o']
+    if qo == 'M':
+        qo_imp = max(sorted(set(non1)), key=non1.count) if non1 else 'O01'
+    else:
+        qo_imp = qo
+    F['qo_imp'] = np.full(n, vocab['qo'].get(qo_imp, -1), float)
+    F['qo_imp_is1'] = np.full(n, float(qo_imp == 'O01'))
+    F['n_non1_case'] = np.full(n, float(len(non1)))
+    F['n_o1_case'] = np.full(n, float(sum(o == 'O01' for o in os_)))
+    F['same_o_imp'] = np.array([np.nan if o == 'M' else float(o == qo_imp) for o in os_])
+    so = np.array([o == qo_imp for o in os_])
+    F['n_same_o_case'] = np.full(n, float(so.sum()))
+    # ---- witness graph typed
+    deg = np.zeros(n); degr = np.zeros((n, 4)); adj = [[] for _ in range(n)]
+    for a, bb, r in wit:
+        ri = FX_RI[r]; deg[a] += 1; deg[bb] += 1; degr[a, ri] += 1; degr[bb, ri] += 1
+        adj[a].append((bb, ri)); adj[bb].append((a, ri))
+    for k in range(4):
+        F['case_wit_R%d' % k] = np.full(n, degr[:, k].sum() / 2)
+    F['case_h0'] = np.full(n, np.nansum(h[:, 0])); F['case_h1'] = np.full(n, np.nansum(h[:, 1])); F['case_h2'] = np.full(n, np.nansum(h[:, 2]))
+    # ---- excess (hidden edges): v - witness degree, h_r - typed witness degree (capped at 2)
+    F['ex_v'] = v - deg
+    F['ex_v_pos'] = (v - deg > 0).astype(float); F['ex_v_pos'][np.isnan(v)] = np.nan
+    exh = h - np.minimum(degr[:, :3], 2)
+    F['ex_h0'] = exh[:, 0]; F['ex_h1'] = exh[:, 1]; F['ex_h2'] = exh[:, 2]
+    F['ex_hsum'] = exh.sum(1) - degr[:, 3]
+    F['ex_any'] = ((F['ex_hsum'] > 0) | (F['ex_v'] > 0)).astype(float)
+    F['n_ex_case'] = np.full(n, np.nansum(F['ex_any']))
+    # inferred RX types: an RX edge is assigned to the relation family with the largest positive excess at its ends
+    rxt = np.zeros((n, 3))
+    for a, bb, r in wit:
+        if r != 'RX':
+            continue
+        sc_ = np.zeros(3)
+        for e in (a, bb):
+            if not hm[e]:
+                sc_ += np.maximum(exh[e], 0)
+        if sc_.sum() > 0:
+            t = int(np.argmax(sc_)); rxt[a, t] += 1; rxt[bb, t] += 1
+    for k in range(3):
+        F['wdeg_inf_R%d' % k] = degr[:, k] + rxt[:, k]
+    # ---- same-code ranks
+    sp = np.array([p == q['p'] and p != 'M' for p in ps])
+    F['drank_samep'] = fx_rank_in(d, sp)
+    F['drank_sameo'] = fx_rank_in(d, so)
+    F['drank_notdiff'] = fx_rank_in(d, np.array([not ((p != 'M' and q['p'] != 'M' and p != q['p']) or (o != 'M' and o != qo_imp)) for p, o in zip(ps, os_)]))
+    F['n_samep_closer'] = np.array([np.sum(sp & (np.nan_to_num(d, nan=99) < (d[i] if np.isfinite(d[i]) else 99))) for i in range(n)], float)
+    F['yrank_samep'] = fx_rank_in(np.array([num(c['y']) for c in cards]), sp)
+    # ---- geometry: approximate planar position from the distance band (radius d+0.5) and bearing sector
+    r = d + 0.5
+    th = (b + 0.5) * np.pi / 4
+    x = r * np.cos(th); yy = r * np.sin(th)
+    pos_ok = np.isfinite(x)
+    D = np.sqrt((x[:, None] - x[None]) ** 2 + (yy[:, None] - yy[None]) ** 2)
+    np.fill_diagonal(D, np.nan)
+    Dz = np.abs(z[:, None] - z[None]); np.fill_diagonal(Dz, np.nan)
+    D3 = np.sqrt(D ** 2 + (0.5 * Dz) ** 2)
+    db = np.abs(b[:, None] - b[None]) % 8; db = np.minimum(db, 8 - db); np.fill_diagonal(db, np.nan)
+
+    def nanmin_rows(M, mask=None):
+        out = np.full(n, np.nan)
+        for i in range(n):
+            row = M[i] if mask is None else np.where(mask, M[i], np.nan)
+            if np.isfinite(row).any():
+                out[i] = np.nanmin(row)
+        return out
+    F['nn_dist'] = nanmin_rows(D)
+    F['nn_dist3'] = nanmin_rows(D3)
+    F['nn_dist_samep'] = nanmin_rows(D, sp)
+    F['nn_dist_sameo'] = nanmin_rows(D, so)
+    F['nn_dz'] = nanmin_rows(Dz)
+    F['n_within1'] = np.nansum(D < 1.0, 1).astype(float)
+    F['n_within2'] = np.nansum(D < 2.0, 1).astype(float)
+    F['n_within2_samep'] = np.nansum((D < 2.0) & sp[None], 1).astype(float)
+    srt = np.sort(np.where(np.isfinite(D), D, np.inf), 1)
+    F['mean3_dist'] = np.where(np.isfinite(srt[:, 2]), srt[:, :3].mean(1), np.nan)
+    F['x'] = x; F['yy'] = yy
+    # occlusion: candidates in same / adjacent sector closer to query
+    dd = np.nan_to_num(d, nan=99)
+    F['n_block0'] = np.array([np.sum((db[i] == 0) & (dd < dd[i])) if np.isfinite(b[i]) else np.nan for i in range(n)], float)
+    F['n_block1'] = np.array([np.sum((db[i] <= 1) & (dd < dd[i])) if np.isfinite(b[i]) else np.nan for i in range(n)], float)
+    F['n_block0_samep'] = np.array([np.sum((db[i] == 0) & (dd < dd[i]) & sp) if np.isfinite(b[i]) else np.nan for i in range(n)], float)
+    F['n_same_b_samep'] = np.array([np.sum((db[i] == 0) & sp) if np.isfinite(b[i]) else np.nan for i in range(n)], float)
+    # distance to the card closest to the query and its relative bearing
+    i0 = int(np.argmin(np.where(np.isfinite(d), d, 99)))
+    F['dist_to_closest'] = D[:, i0]; F['db_to_closest'] = db[:, i0]
+    # distance to the centroid of same-p cards with d <= 2
+    m = sp & pos_ok & (dd <= 2)
+    if m.sum() >= 1:
+        cx, cy = x[m].mean(), yy[m].mean()
+        F['dist_centroid_samep'] = np.sqrt((x - cx) ** 2 + (yy - cy) ** 2)
+    else:
+        F['dist_centroid_samep'] = np.full(n, np.nan)
+    # ---- witness neighbour summaries (typed)
+    F['nb_min_dist'] = np.array([np.nanmin([D[i, j] for j, _ in adj[i]]) if adj[i] and np.isfinite([D[i, j] for j, _ in adj[i]]).any() else np.nan for i in range(n)])
+    F['nb_mean_d'] = np.array([np.nanmean([d[j] for j, _ in adj[i]]) if adj[i] and np.isfinite([d[j] for j, _ in adj[i]]).any() else np.nan for i in range(n)])
+    F['nb_frac_samep'] = np.array([np.mean([sp[j] for j, _ in adj[i]]) if adj[i] else np.nan for i in range(n)])
+    F['nb_n_samep_R2'] = np.array([sum(1 for j, t in adj[i] if sp[j] and t == 2) for i in range(n)], float)
+    F['nb_n_samep_R1'] = np.array([sum(1 for j, t in adj[i] if sp[j] and t == 1) for i in range(n)], float)
+    F['nb_ex_any'] = np.array([sum(1 for j, _ in adj[i] if F['ex_any'][j] > 0) for i in range(n)], float)
+    F['nb_d01'] = np.array([sum(1 for j, _ in adj[i] if dd[j] <= 1) for i in range(n)], float)
+    # 2-hop size
+    F['n_2hop'] = np.array([len({k for j, _ in adj[i] for k, _ in adj[j]} - {i}) for i in range(n)], float)
+    # triangles
+    nbs = [set(j for j, _ in adj[i]) for i in range(n)]
+    F['n_tri'] = np.array([sum(len(nbs[i] & nbs[j]) for j in nbs[i]) / 2 for i in range(n)], float)
+    names = sorted(F)
+    X = np.stack([np.asarray(F[k], float) for k in names], 1)
+    return X, names
+
+
+def fx_components(A):
+    n = len(A); comp = -np.ones(n, int); cid = 0
+    for s in range(n):
+        if comp[s] >= 0: continue
+        st = [s]; comp[s] = cid
+        while st:
+            u = st.pop()
+            for w in np.where(A[u] > 0)[0]:
+                if comp[w] < 0: comp[w] = cid; st.append(w)
+        cid += 1
+    return comp
+
+
+def fx_comp_feats(A, d, sp, ex, pref):
+    """component competition: size / min-distance / same-p-count ranks of a card's component among components
+    with >= 2 cards, component mean distance, excess sum, rank of the card's distance inside its component."""
+    n = 12; F = {}
+    comp = fx_components(A); deg = A.sum(1)
+    sizes = np.bincount(comp)
+    csz = sizes[comp].astype(float)
+    dd = np.where(np.isnan(d), 7, d)
+    cids = np.unique(comp)
+    cmin = {c: dd[comp == c].min() for c in cids}; cmean = {c: dd[comp == c].mean() for c in cids}
+    csp = {c: sp[comp == c].sum() for c in cids}; cex = {c: ex[comp == c].sum() for c in cids}
+    big = [c for c in cids if sizes[c] >= 2]
+    F[pref + 'n_comps2'] = np.full(n, float(len(big)))
+    F[pref + 'max_comp'] = np.full(n, float(sizes.max()))
+    F[pref + 'comp_size_rank'] = np.array([sum(1 for c in big if sizes[c] > sizes[comp[i]]) for i in range(n)], float)
+    F[pref + 'comp_size_gap'] = csz - sizes.max()
+    F[pref + 'comp_mind_rank'] = np.array([sum(1 for c in big if cmin[c] < cmin[comp[i]]) if sizes[comp[i]] >= 2 else np.nan for i in range(n)], float)
+    F[pref + 'comp_meand'] = np.array([cmean[comp[i]] for i in range(n)])
+    F[pref + 'comp_nsp'] = np.array([csp[comp[i]] for i in range(n)], float)
+    F[pref + 'comp_fsp'] = F[pref + 'comp_nsp'] / csz
+    F[pref + 'comp_nsp_rank'] = np.array([sum(1 for c in big if csp[c] > csp[comp[i]]) if sizes[comp[i]] >= 2 else np.nan for i in range(n)], float)
+    F[pref + 'comp_ex'] = np.array([cex[comp[i]] for i in range(n)], float)
+    F[pref + 'size'] = csz
+    F[pref + 'd_rank_in_comp'] = np.array([np.sum((comp == comp[i]) & (dd < dd[i])) for i in range(n)], float)
+    F[pref + 'deg_rel'] = deg / np.maximum(csz - 1, 1)
+    return F
+
+
+def fx_extra3(case):
+    """component features on the raw witness graph (wc_*) and on the hidden-edge-augmented graph (hc_*), which
+    additionally links every pair of cards that both have positive excess (visible degree v or histogram total
+    above the witness degree) and share their p code (or have p masked)."""
+    q, cards, wit = case['q'], case['cards'], case['wit']
+    n = 12
+    d = np.array([num(c['d']) for c in cards])
+    v = np.array([num(c['v']) for c in cards])
+    h = np.array([[np.nan] * 3 if c['h'] in ('M', 'X') else [float(c['h'][k]) for k in range(3)] for c in cards])
+    sp = np.array([c['p'] == q['p'] and c['p'] != 'M' for c in cards])
+    A = np.zeros((n, n)); degr = np.zeros((n, 4))
+    for a, b, r in wit:
+        A[a, b] = A[b, a] = 1; ri = ['R0', 'R1', 'R2', 'RX'].index(r); degr[a, ri] += 1; degr[b, ri] += 1
+    deg = A.sum(1)
+    exv = np.nan_to_num(v - deg, nan=0); exh = np.nan_to_num(h.sum(1) - degr.sum(1), nan=0)
+    ex = np.maximum(np.maximum(exv, exh), 0)
+    F = fx_comp_feats(A, d, sp, ex, 'wc_')
+    A2 = A.copy(); exi = np.where(ex > 0)[0]
+    ps = [c['p'] for c in cards]
+    for i in exi:
+        for j in exi:
+            if i < j and (ps[i] == ps[j] or 'M' in (ps[i], ps[j])):
+                A2[i, j] = A2[j, i] = 1
+    F.update(fx_comp_feats(A2, d, sp, ex, 'hc_'))
+    F['n_ex_pairs'] = np.full(n, float(len(exi)))
+    names = sorted(F)
+    return np.stack([np.asarray(F[k], float) for k in names], 1), names
+
+
+def fx_build(cases, vocab):
+    """(n_cases,12,132) feat-model raw features: case_feats + fx_extra_feats + fx_extra3 (train-only vocabulary)."""
+    Xs = []
+    for c in cases:
+        X1, n1 = case_feats(c, vocab)
+        X2, n2 = fx_extra_feats(c, vocab)
+        X3, n3 = fx_extra3(c)
+        Xs.append(np.concatenate([X1, X2, X3], 1))
+    return np.stack(Xs), n1 + n2 + n3
+
+
+# ----------------------------------------------------------------------------- feat model: nested target encodings
+# and label-free witness p-pair rates (both computed only from the cases a stage-1 model is fit on)
+
+FX_KN = ['qp_cp', 'qo_co', 'qp_cp_d', 'qe_cy', 'qp_d', 'cp_d', 'qp_cp_z', 'qp_cp_y']
+FX_TE_KEYS = ('qp_cp', 'qp_cp_d', 'qp_cp_y')      # (query p, card p), (+ card d band), (+ card year band)
+FX_TE_M = 20.0                                      # smoothing towards the fit-set class prior
+FX_TE_INNER, FX_TE_SEED = 5, 7                      # inner folds giving out-of-fold encodings to training rows
+FX_WP_NAMES = ['wp_R0', 'wp_R1', 'wp_R2', 'wp_RX', 'wp_all']
+
+
+def fx_keys_for(cases):
+    """(n,12,8) object array of code-pair keys (columns FX_KN); raw strings, looked up in fit-set dictionaries."""
+    out = []
+    for c in cases:
+        q = c['q']; rows = []
+        for cd in c['cards']:
+            zs = 'M' if cd['z'] in ('M', 'X') else ('0' if cd['z'] == '0' else cd['z'][0])
+            rows.append((q['p'] + '|' + cd['p'], q['o'] + '|' + cd['o'], q['p'] + '|' + cd['p'] + '|' + cd['d'], q['e'] + '|' + cd['y'],
+                         q['p'] + '|' + cd['d'], cd['p'] + '|' + cd['d'], q['p'] + '|' + cd['p'] + '|' + zs, q['p'] + '|' + cd['p'] + '|' + cd['y']))
+        out.append(rows)
+    return np.array(out, dtype=object)
+
+
+def fx_te_stats(K, Y):
+    """K (n,12,nk) keys; Y (n,12) -> list of dicts key -> [count, class counts (4)]."""
+    st = []
+    T = np.eye(4)[Y.reshape(-1)]
+    Kf = K.reshape(-1, K.shape[2])
+    for j in range(K.shape[2]):
+        dct = defaultdict(lambda: np.zeros(5))
+        for kk, t in zip(Kf[:, j], T):
+            a = dct[kk]; a[0] += 1; a[1:] += t
+        st.append(dict(dct))
+    return st
+
+
+def fx_te_apply(st, K, prior, m):
+    """smoothed class rates (counts + m * prior) / (n + m); unseen key -> prior. Per key: edge, R0, R1, R2 rates."""
+    n = K.shape[0]; Kf = K.reshape(-1, K.shape[2]); out = []
+    for j, dct in enumerate(st):
+        vals = np.zeros((len(Kf), 4))
+        for i, kk in enumerate(Kf[:, j]):
+            a = dct.get(kk)
+            if a is None:
+                vals[i] = prior
+            else:
+                vals[i] = (a[1:] + m * prior) / (a[0] + m)
+        out.append(1 - vals[:, 0]); out += [vals[:, 1], vals[:, 2], vals[:, 3]]
+    return np.stack(out, 1).reshape(n, 12, -1)
+
+
+def fx_te_names(KN):
+    return ['te_%s_%s' % (k, t) for k in KN for t in ('e', 'r0', 'r1', 'r2')]
+
+
+def fx_te_features(Ka, Ya, Kb, m):
+    """nested target encoding: training rows (Ka, Ya) get inner FX_TE_INNER-fold out-of-fold encodings; apply
+    rows Kb get encodings from all of (Ka, Ya)."""
+    prior = np.bincount(Ya.reshape(-1), minlength=4) / Ya.size
+    fo = folds(len(Ka), FX_TE_INNER, FX_TE_SEED)
+    Ta = None
+    for j in range(FX_TE_INNER):
+        st = fx_te_stats(Ka[fo != j], Ya[fo != j])
+        tj = fx_te_apply(st, Ka[fo == j], prior, m)
+        if Ta is None:
+            Ta = np.zeros((len(Ka), 12, tj.shape[2]))
+        Ta[fo == j] = tj
+    st = fx_te_stats(Ka, Ya)
+    Tb = fx_te_apply(st, Kb, prior, m)
+    return Ta, Tb
+
+
+def fx_wit_pair_stats(cases):
+    """label-free: for unordered candidate p-code pairs, candidate-pair counts and visible witness edge counts per
+    type (R0, R1, R2, RX) over the given (training) cases."""
+    cnt = defaultdict(float); et = defaultdict(lambda: np.zeros(4))
+    for c in cases:
+        ps = [cd['p'] for cd in c['cards']]
+        for i in range(12):
+            for j in range(i + 1, 12):
+                if 'M' in (ps[i], ps[j]): continue
+                cnt[tuple(sorted((ps[i], ps[j])))] += 1
+        for a, b, r in c['wit']:
+            if 'M' in (ps[a], ps[b]): continue
+            et[tuple(sorted((ps[a], ps[b])))][['R0', 'R1', 'R2', 'RX'].index(r)] += 1
+    return cnt, dict(et)
+
+
+def fx_wit_pair_feats(stats, cases, m=20.0):
+    """per card: smoothed witness edge rates per type (and their sum) of the (query p, card p) code pair."""
+    cnt, et = stats
+    tot = sum(cnt.values()); prior = sum(et.values(), np.zeros(4)) / max(tot, 1)
+    out = np.full((len(cases), 12, 5), np.nan)
+    for i, c in enumerate(cases):
+        qp = c['q']['p']
+        for j, cd in enumerate(c['cards']):
+            if 'M' in (qp, cd['p']): continue
+            k = tuple(sorted((qp, cd['p'])))
+            n = cnt.get(k, 0.0); e = et.get(k, np.zeros(4))
+            r = (e + m * prior) / (n + m)
+            out[i, j, :4] = r; out[i, j, 4] = r.sum()
+    return out
+
+
+# ----------------------------------------------------------------------------- feat model: stage-2 context
+
+
+def fx_case_struct(case):
+    """per-case geometry / graph structures used by the stage-2 context features."""
+    q, cards, wit = case['q'], case['cards'], case['wit']
+    d = np.array([num(c['d']) for c in cards]); b = np.array([num(c['b']) for c in cards])
+    r = d + 0.5; th = (b + 0.5) * np.pi / 4
+    x = r * np.cos(th); y = r * np.sin(th)
+    D = np.sqrt((x[:, None] - x[None]) ** 2 + (y[:, None] - y[None]) ** 2); np.fill_diagonal(D, np.nan)
+    A = np.zeros((12, 12)); T = np.full((12, 12), -1)
+    for a, bb, rr in wit:
+        A[a, bb] = A[bb, a] = 1; T[a, bb] = T[bb, a] = ['R0', 'R1', 'R2', 'RX'].index(rr)
+    sp = np.array([c['p'] == q['p'] and c['p'] != 'M' for c in cards])
+    v = np.array([num(c['v']) for c in cards])
+    hh = np.array([np.nan if c['h'] in ('M', 'X') else float(sum(int(ch) for ch in c['h'])) for c in cards])
+    deg = A.sum(1); ex = np.maximum(np.maximum(np.nan_to_num(v - deg, nan=0), np.nan_to_num(hh - deg, nan=0)), 0)
+    Ah = A.copy(); exi = np.where(ex > 0)[0]; ps = [c['p'] for c in cards]
+    for i in exi:
+        for j in exi:
+            if i < j and (ps[i] == ps[j] or 'M' in (ps[i], ps[j])):
+                Ah[i, j] = Ah[j, i] = 1
+    comph = fx_components(Ah)
+    comp = fx_components(A)
+    zz = np.array([zval(c['z']) for c in cards]); yv = np.array([num(c['y']) for c in cards])
+    return dict(D=D, A=A, T=T, sp=sp, comp=comp, Ah=Ah, comph=comph, b=b.copy(), d=d.copy(), p=ps, z=zz, y=yv)
+
+
+def fx_ctx_feats(P, S):
+    """P (12,4) stage-1 probs of one case; S fx_case_struct -> (12, 62) context features, names (sorted)."""
+    F = {}
+    pe = 1 - P[:, 0]; pr = P[:, 1:]
+    # own probabilities, logit, row rank and gaps; case-level sums / top-3 / counts; type shares
+    F['s1_pe'] = pe
+    for r in range(3): F['s1_pR%d' % r] = pr[:, r]
+    F['s1_lpe'] = np.log(pe + 1e-6) - np.log(1 - pe + 1e-6)
+    o = np.argsort(-pe); rk = np.empty(12); rk[o] = np.arange(12)
+    F['s1_rank'] = rk
+    srt = pe[o]
+    F['s1_gap_top'] = pe - srt[0]
+    F['s1_gap_next'] = np.array([pe[i] - (srt[int(rk[i]) + 1] if rk[i] < 11 else 0) for i in range(12)])
+    F['s1_gap_prev'] = np.array([(srt[int(rk[i]) - 1] if rk[i] > 0 else 1) - pe[i] for i in range(12)])
+    F['s1_sum'] = np.full(12, pe.sum()); F['s1_max'] = np.full(12, srt[0]); F['s1_2nd'] = np.full(12, srt[1]); F['s1_3rd'] = np.full(12, srt[2])
+    F['s1_n05'] = np.full(12, float((pe > 0.5).sum())); F['s1_n03'] = np.full(12, float((pe > 0.3).sum()))
+    F['s1_share'] = pe / pe.sum()
+    tm = pr.sum(0) / max(pe.sum(), 1e-9)
+    for r in range(3): F['s1_case_t%d' % r] = np.full(12, tm[r])
+    ownt = pr / np.maximum(pe[:, None], 1e-9)
+    for r in range(3): F['s1_own_t%d' % r] = ownt[:, r]
+    # witness neighbours (typed), 2-hop, witness component, geometric kernels, nearest card, same-p cards
+    A, T, D, sp, comp = S['A'], S['T'], S['D'], S['sp'], S['comp']
+    deg = A.sum(1)
+    F['nb_pe_max'] = np.where(deg > 0, (A * pe[None]).max(1), np.nan)
+    F['nb_pe_sum'] = (A * pe[None]).sum(1)
+    for t in range(4):
+        F['nb_pe_sum_T%d' % t] = ((T == t) * pe[None]).sum(1)
+    for r in range(3):
+        F['nb_pr_sum_R%d' % r] = (A * pr[:, r][None]).sum(1)
+    A2 = ((A @ A) > 0).astype(float); np.fill_diagonal(A2, 0); A2 = A2 * (1 - A)
+    F['nb2_pe_max'] = np.where(A2.sum(1) > 0, (A2 * pe[None]).max(1), np.nan)
+    same_c = (comp[:, None] == comp[None]).astype(float); np.fill_diagonal(same_c, 0)
+    F['comp_pe_sum'] = (same_c * pe[None]).sum(1)
+    Dn = np.nan_to_num(D, nan=99)
+    F['geo_pe1'] = (np.exp(-Dn) * pe[None]).sum(1)
+    F['geo_pe2'] = (np.exp(-Dn / 2) * pe[None]).sum(1)
+    j0 = o[0]; j1 = o[1]
+    F['dist_top1'] = np.where(np.arange(12) == j0, D[:, j1], D[:, j0])
+    nn_ = np.array([np.nanargmin(D[i]) if np.isfinite(D[i]).any() else -1 for i in range(12)])
+    F['nn_pe'] = np.array([pe[nn_[i]] if nn_[i] >= 0 else np.nan for i in range(12)])
+    spo = sp[None] * (1 - np.eye(12))
+    F['sp_pe_max'] = np.where(spo.sum(1) > 0, (spo * pe[None]).max(1), np.nan)
+    F['sp_pe_sum'] = (spo * pe[None]).sum(1)
+    F['sp_rank'] = np.array([np.sum(sp & (pe > pe[i])) for i in range(12)], float)
+    # hidden-edge-augmented graph components; relations to the top-1 card
+    Ah, comph = S['Ah'], S['comph']
+    sch = (comph[:, None] == comph[None]).astype(float); np.fill_diagonal(sch, 0)
+    F['hc_pe_sum'] = (sch * pe[None]).sum(1)
+    F['hc_pe_max'] = np.where(sch.sum(1) > 0, (sch * pe[None]).max(1), np.nan)
+    F['hc_pe_mean'] = np.where(sch.sum(1) > 0, (sch * pe[None]).sum(1) / np.maximum(sch.sum(1), 1), np.nan)
+    F['hnb_pe_max'] = np.where(Ah.sum(1) > 0, (Ah * pe[None]).max(1), np.nan)
+    cs = {c: pe[comph == c].sum() for c in np.unique(comph)}
+    csz = np.bincount(comph)
+    big = [c for c in cs if csz[c] >= 2]
+    F['hc_pesum_rank'] = np.array([sum(1 for c in big if cs[c] > cs[comph[i]]) if csz[comph[i]] >= 2 else np.nan for i in range(12)], float)
+    F['hc_pesum_gap'] = np.array([cs[comph[i]] - max([cs[c] for c in big if c != comph[i]], default=0) for i in range(12)], float)
+    top = j0
+    F['top_same_comp'] = np.where(np.arange(12) == top, np.nan, (comph == comph[top]).astype(float))
+    F['top_adj'] = np.where(np.arange(12) == top, np.nan, Ah[:, top])
+    F['top_same_p'] = np.where(np.arange(12) == top, np.nan, np.array([float(S['p'][i] == S['p'][top]) if 'M' not in (S['p'][i], S['p'][top]) else np.nan for i in range(12)]))
+    bb = S['b']; dbt = np.abs(bb - bb[top]) % 8; dbt = np.minimum(dbt, 8 - dbt)
+    F['top_db'] = np.where(np.arange(12) == top, np.nan, dbt)
+    F['top_dd'] = np.where(np.arange(12) == top, np.nan, S['d'] - S['d'][top])
+    F['top_pe'] = np.full(12, pe[top])
+    # pe-weighted mean distance to the other likely neighbours
+    w = pe[None] * (1 - np.eye(12)); Dn2 = np.where(np.isfinite(D), D, np.nan)
+    F['wdist_pe'] = np.nansum(w * Dn2, 1) / np.maximum(np.nansum(w * np.isfinite(Dn2), 1), 1e-9)
+    # similarity to likely neighbours: pe-weighted means (ln_*) and top-3-card means (t3_*) of same p, bearing /
+    # height / distance-band / year-band differences and planar distance
+    w = pe[None] * (1 - np.eye(12))
+    pp = S['p']
+    Mp = np.array([[float(pp[i] == pp[j]) if 'M' not in (pp[i], pp[j]) else np.nan for j in range(12)] for i in range(12)])
+
+    def wmean(M):
+        ok = np.isfinite(M) & (w > 0)
+        return np.where(ok.any(1), np.nansum(np.where(ok, w * M, 0), 1) / np.maximum(np.where(ok, w, 0).sum(1), 1e-9), np.nan)
+    F['ln_samep'] = wmean(Mp)
+    dbm = np.abs(bb[:, None] - bb[None]) % 8; dbm = np.minimum(dbm, 8 - dbm)
+    F['ln_db'] = wmean(dbm)
+    F['ln_dz'] = wmean(np.abs(S['z'][:, None] - S['z'][None]))
+    F['ln_dd'] = wmean(np.abs(S['d'][:, None] - S['d'][None]))
+    F['ln_dy'] = wmean(np.abs(S['y'][:, None] - S['y'][None]))
+    F['ln_dist'] = wmean(D)
+    o3 = o[:3]; w3 = np.zeros((12, 12)); w3[:, o3] = 1; np.fill_diagonal(w3, 0)
+
+    def hmean(M):
+        ok = np.isfinite(M) & (w3 > 0)
+        return np.where(ok.any(1), np.nansum(np.where(ok, M, 0), 1) / np.maximum(ok.sum(1), 1), np.nan)
+    F['t3_samep'] = hmean(Mp); F['t3_dist'] = hmean(D); F['t3_dz'] = hmean(np.abs(S['z'][:, None] - S['z'][None]))
+    names = sorted(F)
+    return np.stack([F[k] for k in names], 1), names
+
+
+def fx_build_ctx(P, structs):
+    out = []
+    for i in range(len(P)):
+        Xc, names = fx_ctx_feats(P[i], structs[i]); out.append(Xc)
+    return np.stack(out), names
+
+
+# ----------------------------------------------------------------------------- feat model: two-stage LightGBM
+
+FX_S1PRM = dict(objective='multiclass', num_class=4, learning_rate=0.03, num_leaves=15, min_data_in_leaf=50, feature_fraction=0.5,
+                bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1, num_threads=THREADS, seed=SEED,
+                deterministic=True, force_col_wise=True)
+FX_PRM2 = dict(learning_rate=0.03, num_leaves=7, min_data_in_leaf=150, feature_fraction=0.5)   # stage 2 overrides
+FX_R1, FX_R2 = 500, 300
+FX_S2SEEDS = (0, 1, 2)
+
+
+def fx_catidx(names):
+    return [names.index(k) for k in names if k.startswith('c_') or k.startswith('q_') or k == 'qo_imp']
+
+
+def fx_fit_predict(X, Y, Xb, names, prm, rounds, seed):
+    """LightGBM multiclass on (X, Y) with FX_S1PRM updated by prm and the given seed; probabilities on Xb."""
+    p = dict(FX_S1PRM); p.update(prm or {}); p['seed'] = seed
+    ds = lgb.Dataset(X.reshape(-1, X.shape[2]), Y.reshape(-1), categorical_feature=fx_catidx(names), free_raw_data=False)
+    m = lgb.train(p, ds, num_boost_round=rounds)
+    return m.predict(Xb.reshape(-1, Xb.shape[2])).reshape(-1, 12, 4)
+
+
+def fx_stage1(X, K, Y, tr, names, tri, Xb, Kb, cases_b):
+    """stage-1 model fit on training cases tri: raw features + nested target encodings (fx_te_features) + witness
+    p-pair rates (statistics from the tri cases only); returns probabilities for the apply rows (Xb, Kb, cases_b)."""
+    use = [FX_KN.index(k) for k in FX_TE_KEYS]
+    ta, tb = fx_te_features(K[tri][:, :, use], Y[tri], Kb[:, :, use], m=FX_TE_M)
+    stt = fx_wit_pair_stats([tr[i] for i in tri])
+    Xa = np.concatenate([X[tri], ta, fx_wit_pair_feats(stt, [tr[i] for i in tri])], 2)
+    Xb = np.concatenate([Xb, tb, fx_wit_pair_feats(stt, cases_b)], 2)
+    nm = list(names) + fx_te_names([FX_KN[u] for u in use]) + FX_WP_NAMES
+    return fx_fit_predict(Xa, Y[tri], Xb, nm, None, FX_R1, seed=0)
+
+
+def train_feat(tr, te, Y, vocab):
+    """feat two-stage LightGBM -> test probabilities (n_test,12,4). Stage 1: 5-fold (fold seed SEED) out-of-fold
+    probabilities for train and a model fit on all train for test. Stage 2: contextual LightGBM on the raw
+    features + fx_ctx_feats of the stage-1 probabilities, fit on all train with the out-of-fold stage-1 context,
+    applied to the test context; averaged over FX_S2SEEDS."""
+    X, names = fx_build(tr, vocab)
+    Xt, _ = fx_build(te, vocab)
+    K, Kt = fx_keys_for(tr), fx_keys_for(te)
+    n = len(tr)
+    fo = folds(n, 5, SEED)
+    oof = np.zeros((n, 12, 4))
+    for k in range(5):
+        tri = np.where(fo != k)[0]; vai = np.where(fo == k)[0]
+        oof[vai] = fx_stage1(X, K, Y, tr, names, tri, X[vai], K[vai], [tr[i] for i in vai])
+    P1t = fx_stage1(X, K, Y, tr, names, np.arange(n), Xt, Kt, te)
+    print('feat stage 1 done', flush=True)
+    C, cn = fx_build_ctx(oof, [fx_case_struct(c) for c in tr])
+    Ct, _ = fx_build_ctx(P1t, [fx_case_struct(c) for c in te])
+    Xa, Xb, nm = np.concatenate([X, C], 2), np.concatenate([Xt, Ct], 2), names + cn
+    P2t = 0
+    for sd in FX_S2SEEDS:
+        P2t = P2t + fx_fit_predict(Xa, Y, Xb, nm, FX_PRM2, FX_R2, seed=sd) / len(FX_S2SEEDS)
+    print('feat stage 2 done', flush=True)
+    return P2t
+
+
+# ----------------------------------------------------------------------------- expected-utility decoder
+
+
+def _atoms_arr(L):
+    """L (n,12) -> padded atom array (n,24) and lengths; handle atoms 0..11, rel atoms 100+r."""
+    n = len(L)
+    A = np.full((n, 24), -1, int)
+    ln = np.zeros(n, int)
+    for c in range(12):
+        m = L[:, c] > 0
+        rows = np.where(m)[0]
+        A[rows, ln[rows]] = c
+        A[rows, ln[rows] + 1] = 100 + L[rows, c]
+        ln[rows] += 2
+    return A, ln
+
+
+def lev_rows(Ga, gl, Pa, pl):
+    """row-wise Levenshtein between padded int sequences; vectorised over rows (rows sorted by gold length so
+    the active set shrinks as the DP advances)."""
+    n = len(Ga)
+    if n == 0:
+        return np.zeros(0, int)
+    srt = np.argsort(-gl, kind='stable')
+    Ga, gl, Pa, pl = Ga[srt], gl[srt], Pa[srt], pl[srt]
+    Lg = int(gl[0])
+    Lp = int(pl.max())
+    prev = np.tile(np.arange(Lp + 1), (n, 1))
+    res = np.where(gl == 0, pl, 0).astype(int)
+    cnt = np.array([(gl >= i).sum() for i in range(Lg + 2)])
+    for i in range(1, Lg + 1):
+        na = cnt[i]
+        pv = prev[:na]
+        cur = np.empty_like(pv)
+        cur[:, 0] = i
+        gi = Ga[:na, i - 1]
+        Pn = Pa[:na]
+        for j in range(1, Lp + 1):
+            np.minimum(np.minimum(pv[:, j], cur[:, j - 1]) + 1, pv[:, j - 1] + (gi != Pn[:, j - 1]), out=cur[:, j])
+        m = slice(cnt[i + 1], na)          # rows with gl == i
+        res[m] = cur[m, :][np.arange(na - cnt[i + 1]), pl[m]]
+        prev = cur
+    out = np.empty_like(res)
+    out[srt] = res
+    return out
+
+
+def pb_dist(p):
+    """Poisson-binomial pmf. p (..., m) -> (..., m+1)."""
+    sh = p.shape[:-1]
+    m = p.shape[-1]
+    d = np.zeros(sh + (m + 1,))
+    d[..., 0] = 1.0
+    for j in range(m):
+        pj = p[..., j:j + 1]
+        nd = d * (1 - pj)
+        nd[..., 1:] += d[..., :-1] * pj
+        d = nd
+    return d
+
+
+def exp_dice_topk(pe_sorted, kmax=6, cond_nonempty=True, r=None):
+    """pe_sorted (n,12) edge probs sorted desc. Returns (n,kmax) E[Dice] for top-k sets, k=1..kmax.
+    r (n,13) optional reweighting of the gold size m: P(config) ∝ prod Bern * r[m]."""
+    n, m = pe_sorted.shape
+    out = np.zeros((n, kmax))
+    if r is None:
+        r = np.ones((n, m + 1))
+        if cond_nonempty:
+            r[:, 0] = 0.0
+    for k in range(1, kmax + 1):
+        PX = pb_dist(pe_sorted[:, :k])          # (n,k+1)
+        PY = pb_dist(pe_sorted[:, k:])          # (n,m-k+1)
+        x = np.arange(k + 1)[:, None]; y = np.arange(m - k + 1)[None, :]
+        val = 2 * x / (x + y + k)               # (k+1, m-k+1)
+        R = r[:, (x + y)]                       # (n,k+1,m-k+1)
+        joint = PX[:, :, None] * PY[:, None, :] * R
+        out[:, k - 1] = (joint * val[None]).sum((1, 2)) / np.maximum(joint.sum((1, 2)), 1e-300)
+    return out
+
+
+def sample_gold(P, S=32, seed=0, cond_nonempty=True):
+    """independent categorical draws per candidate -> (n,S,12) labels; empty draws redrawn (up to 30 tries)."""
+    rng = np.random.RandomState(seed)
+    n = len(P)
+    cum = np.cumsum(P, 2)[:, :, :3]                       # thresholds for classes 1..3
+    u = rng.rand(n, S, 12)
+    G = (u[..., None] > cum[:, None, :, :]).sum(3)
+    if cond_nonempty:
+        for it in range(30):
+            ii, ss = np.where((G > 0).sum(2) == 0)
+            if len(ii) == 0:
+                break
+            u = rng.rand(len(ii), 12)
+            G[ii, ss] = (u[..., None] > cum[ii]).sum(2)
+    return G
+
+
+def exp_C_topk(order, types, G, kmax=6, wts=None):
+    """order (n,12) candidate indices sorted by priority, types (n,12) label 1..3 per candidate,
+    G (n,S,12) sampled gold, wts (n,S) optional importance weights. Returns (n,kmax) MC estimate of E[C]."""
+    n, S, _ = G.shape
+    Ga, gl = _atoms_arr(G.reshape(n * S, 12))
+    out = np.zeros((n, kmax))
+    if wts is None:
+        wts = np.full((n, S), 1.0 / S)
+    else:
+        wts = wts / np.maximum(wts.sum(1, keepdims=True), 1e-300)
+    for k in range(1, kmax + 1):
+        L = np.zeros((n, 12), int)
+        rows = np.arange(n)[:, None]
+        L[rows, order[:, :k]] = types[rows, order[:, :k]]
+        Pa, pl = _atoms_arr(np.repeat(L, S, 0))
+        lev = lev_rows(Ga, gl, Pa, pl)
+        C = 1 - lev / np.maximum(np.maximum(gl, pl), 1)
+        out[:, k - 1] = (C.reshape(n, S) * wts).sum(1)
+    return out
+
+
+def _labels_from_k(order, types, kb):
+    n = len(order)
+    L = np.zeros((n, 12), int)
+    ranks = np.empty_like(order)
+    np.put_along_axis(ranks, order, np.arange(12)[None, :].repeat(n, 0), 1)
+    m = ranks < kb[:, None]
+    L[m] = types[m]
+    return L
+
+
+# ----------------------------------------------------------------------------- pipeline
+def load_split(path):
+    df = pd.read_csv(path)
+    cases = [dict(id=r.id, q=parse_query(r.query_card), cards=parse_cards(r.candidate_stream),
+                  wit=parse_witness(r.witness_stream)) for r in df.itertuples(index=False)]
+    Y = labels_from_programs(df.insertion_program) if 'insertion_program' in df else None
+    return df, cases, Y
+
+
+def train_stage1(X, Y, Xt, cat, fo):
+    """5-fold out-of-fold stage-1 probabilities for train and fold-averaged probabilities for test."""
+    n, nt, k = len(X), len(Xt), X.shape[2]
+    P = np.zeros((n, 12, 4))
+    Pt = np.zeros((nt, 12, 4))
+    for f in range(fo.max() + 1):
+        trm = fo != f
+        m = lgb.train(PRM1, lgb.Dataset(X[trm].reshape(-1, k), Y[trm].reshape(-1), categorical_feature=cat),
+                      num_boost_round=ROUNDS1)
+        P[~trm] = m.predict(X[~trm].reshape(-1, k)).reshape(-1, 12, 4)
+        Pt += m.predict(Xt.reshape(-1, k)).reshape(-1, 12, 4) / (fo.max() + 1)
+    return P, Pt
+
+
+def train_stage2(F, Y, Ft, fo):
+    """out-of-fold stage-2 probabilities (used only to estimate decoder operating points) and test probabilities
+    from a stage-2 model fit on all training cases."""
+    k = F.shape[2]
+    P2 = np.zeros((len(F), 12, 4))
+    for f in range(fo.max() + 1):
+        trm = fo != f
+        m = lgb.train(PRM2, lgb.Dataset(F[trm].reshape(-1, k), Y[trm].reshape(-1)), num_boost_round=ROUNDS2)
+        P2[~trm] = m.predict(F[~trm].reshape(-1, k)).reshape(-1, 12, 4)
+    m = lgb.train(PRM2, lgb.Dataset(F.reshape(-1, k), Y.reshape(-1)), num_boost_round=ROUNDS2)
+    return P2, m.predict(Ft.reshape(-1, k)).reshape(-1, 12, 4)
+
+
+def eu_decode(P, gold_rate, theta, S=EU_SAMPLES, seed=SEED, kmax=6):
+    """expected-utility decoding: per case, relation family t_c = argmax_r beta_r (q_cr - theta_r) and the
+    number k of top-ranked (by edge probability) candidates maximising
+    W_A E[Dice] + W_C E[C] + sum over chosen tokens 2 beta_r (q - theta_r)  (linearised pooled F1 term)."""
+    q = P[:, :, 1:]
+    pe = 1 - P[:, :, 0]
+    order = np.argsort(-pe, 1, kind='stable')
+    ED = exp_dice_topk(np.take_along_axis(pe, order, 1), kmax)
+    G = sample_gold(P, S, seed)
+    beta = (W_B / 3) / (2 * np.asarray(gold_rate, float))
+    theta = np.asarray(theta, float)
+    types = (beta * 2 * (q - theta)).argmax(2) + 1
+    EC = exp_C_topk(order, types, G, kmax)
+    qt = np.take_along_axis(q, (types - 1)[..., None], 2)[..., 0]
+    qo = np.take_along_axis(qt, order, 1)[:, :kmax]
+    to = np.take_along_axis(types, order, 1)[:, :kmax]
+    u = 2 * beta[to - 1] * (qo - theta[to - 1])
+    J = W_A * ED + W_C * EC + np.cumsum(u, 1)
+    return _labels_from_k(order, types, J.argmax(1) + 1)
+
+
+def metric(L, Y):
+    """official score (0-100) and per-relation pooled F1 for label arrays L, Y (n,12) with 0 none, 1..3 R0..R2."""
+    Ga, gl = _atoms_arr(Y)
+    Pa, pl = _atoms_arr(L)
+    lev = lev_rows(Ga, gl, Pa, pl)
+    C = np.where(pl > 0, 1 - lev / np.maximum(np.maximum(gl, pl), 1), 0.0)
+    Ng, Np = Y > 0, L > 0
+    A = 2 * (Ng & Np).sum(1) / np.maximum(Ng.sum(1) + Np.sum(1), 1)
+    f1 = np.zeros(3)
+    for r in range(3):
+        tp = ((L == r + 1) & (Y == r + 1)).sum()
+        fp = ((L == r + 1) & (Y != r + 1)).sum()
+        fn = ((Y == r + 1) & (L != r + 1)).sum()
+        f1[r] = 2 * tp / max(2 * tp + fp + fn, 1)
+    return 100 * float(np.clip(W_A * A.mean() + W_B * f1.mean() + W_C * C.mean(), 0, 1)), f1
+
+
+def program(row):
+    toks = ['c%02d:%s' % (c, RELS[row[c] - 1]) for c in range(12) if row[c] > 0]
+    assert 1 <= len(toks) <= 6
+    return ' '.join(toks)
+
+
+def main(public_dir, out_path):
+    np.random.seed(SEED)
+    _, tr, Y = load_split(os.path.join(public_dir, 'train.csv'))
+    dft, te, _ = load_split(os.path.join(public_dir, 'test.csv'))
+    vocab = build_vocab([tr])                                   # train-only vocabulary
+    X, names = build(tr, vocab)
+    Xt, _ = build(te, vocab)
+    cat = [names.index(k) for k in names if k.startswith('c_') or k.startswith('q_')]
+    fo = folds(len(tr), 5, SEED)
+    P1, P1t = train_stage1(X, Y, Xt, cat, fo)
+    print('stage 1 done', flush=True)
+    A, At = adj_tensor(tr), adj_tensor(te)
+    F = stack_feats(P1, A, comp_matrix(A))
+    Ft = stack_feats(P1t, At, comp_matrix(At))
+    P2, P2t = train_stage2(F, Y, Ft, fo)
+    print('stage 2 done', flush=True)
+    # decoder operating points learned from training labels / stage-2 out-of-fold predictions
+    gold_rate = np.array([(Y == r + 1).sum() for r in range(3)], float) / len(Y)
+    theta = np.full(3, 0.25)
+    for _ in range(2):
+        s, f1 = metric(eu_decode(P2, gold_rate, theta), Y)
+        theta = f1 / 2
+    s, f1 = metric(eu_decode(P2, gold_rate, theta), Y)
+    print('stage-2 train OOF score %.4f  F1 %s  theta %s' % (s, np.round(f1, 4), np.round(theta, 4)), flush=True)
+    # feat two-stage LightGBM (evidence features, nested target encodings, witness p-pair rates, contextual stage 2)
+    Pf = train_feat(tr, te, Y, vocab)
+    # equal-weight geometric blend of the feat stage-2 and stack stage-2 test probabilities (each clipped at
+    # 1e-9), renormalised over the 4 classes
+    P = np.exp((np.log(np.clip(Pf, 1e-9, 1)) + np.log(np.clip(P2t, 1e-9, 1))) / 2)
+    P /= P.sum(2, keepdims=True)
+    L = eu_decode(P, gold_rate, theta)
+    sub = pd.DataFrame({'id': dft['id'], 'insertion_program': [program(row) for row in L]})
+    assert sub['id'].is_unique and len(sub) == len(dft)
+    sub.to_csv(out_path, index=False)
+    print('wrote', out_path, len(sub), 'rows; mean tokens %.3f' % (L > 0).sum(1).mean(), flush=True)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1], sys.argv[2])
