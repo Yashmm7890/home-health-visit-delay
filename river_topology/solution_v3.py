@@ -31,7 +31,7 @@ Requirement map
   depth then token string, single spaces.
 - Only the supplied public files are used; test rows are used only for inference (no fitting on test).
 - Determinism: fixed seeds, fixed thread count (THREADS), deterministic LightGBM, no clock reads.
-- CPU only. Measured runtime: about 11 minutes on 4 CPU cores.
+- CPU only. Measured runtime: about 10 minutes (608 s) on 4 CPU cores.
 """
 import json
 import math
