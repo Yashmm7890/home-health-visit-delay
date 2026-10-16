@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 
-THREADS = 4
+THREADS = 1
 SEED = 0
 W_A, W_B, W_C = 0.45, 0.35, 0.20
 RELS = ['R0', 'R1', 'R2']
@@ -502,10 +502,12 @@ def main(public_dir, out_path):
     cat = [names.index(k) for k in names if k.startswith('c_') or k.startswith('q_')]
     fo = folds(len(tr), 5, SEED)
     P1, P1t = train_stage1(X, Y, Xt, cat, fo)
+    print('stage 1 done', flush=True)
     A, At = adj_tensor(tr), adj_tensor(te)
     F = stack_feats(P1, A, comp_matrix(A))
     Ft = stack_feats(P1t, At, comp_matrix(At))
     P2, P2t = train_stage2(F, Y, Ft, fo)
+    print('stage 2 done', flush=True)
     # decoder operating points learned from training labels / out-of-fold predictions
     gold_rate = np.array([(Y == r + 1).sum() for r in range(3)], float) / len(Y)
     theta = np.full(3, 0.25)
