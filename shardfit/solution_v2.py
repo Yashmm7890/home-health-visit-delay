@@ -418,8 +418,9 @@ def nn_tensorise(cases, V):
 
 def nn_std_hand(Xtr, Xs):
     """standardise hand features with statistics of Xtr (train rows only), clip to +-5; NaN -> 0 plus NaN
-    indicators for the columns that have NaN in train."""
-    F = Xtr.reshape(-1, Xtr.shape[-1])
+    indicators for the columns that have NaN in train. Statistics are reduced over a C-contiguous copy so the
+    float32 summation order does not depend on the caller's memory layout."""
+    F = np.ascontiguousarray(Xtr).reshape(-1, Xtr.shape[-1])
     mu = np.nanmean(F, 0); sd = np.nanstd(F, 0) + 1e-6
     nancols = np.isnan(F).any(0)
     out = []
